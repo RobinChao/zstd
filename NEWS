@@ -1,8 +1,18 @@
-v1.0.1
+v1.1.1
+New : command -M#, --memory=, --memlimit=, --memlimit-decompress= to limit allowed memory consumption
+
+v1.1.0
 New : contrib/pzstd, parallel version of zstd, by Nick Terrell
+added : NetBSD install target (#338)
+Improved : speed for batches of small files
+Improved : speed of zlib wrapper, by Przemyslaw Skibinski
+Changed : libzstd on Windows supports legacy formats, by Christophe Chevalier
 Fixed : CLI -d output to stdout by default when input is stdin (#322)
 Fixed : CLI correctly detects console on Mac OS-X
+Fixed : CLI supports recursive mode `-r` on Mac OS-X
+Fixed : Legacy decoders use unified error codes, reported by benrg (#341), fixed by Przemyslaw Skibinski
 Fixed : compatibility with OpenBSD, reported by Juan Francisco Cantero Hurtado (#319)
+Fixed : compatibility with Hurd, by Przemyslaw Skibinski (#365)
 Fixed : zstd-pgo, reported by octoploid (#329)
 
 v1.0.0

@@ -505,7 +505,8 @@ static size_t ZDICT_trainBuffer(dictItem* dictList, U32 dictListSize,
     {   size_t pos;
         for (pos=0; pos < bufferSize; pos++)
             reverseSuffix[suffix[pos]] = (U32)pos;
-        /* build file pos */
+        /* note filePos tracks borders between samples.
+           It's not used at this stage, but planned to become useful in a later update */
         filePos[0] = 0;
         for (pos=1; pos<nbFiles; pos++)
             filePos[pos] = (U32)(filePos[pos-1] + fileSizes[pos-1]);
@@ -563,7 +564,7 @@ static void ZDICT_countEStats(EStats_ress_t esr, ZSTD_parameters params,
     size_t cSize;
 
     if (srcSize > blockSizeMax) srcSize = blockSizeMax;   /* protection vs large samples */
-    {  size_t const errorCode = ZSTD_copyCCtx(esr.zc, esr.ref);
+    {  size_t const errorCode = ZSTD_copyCCtx(esr.zc, esr.ref, 0);
             if (ZSTD_isError(errorCode)) { DISPLAYLEVEL(1, "warning : ZSTD_copyCCtx failed \n"); return; }
     }
     cSize = ZSTD_compressBlock(esr.zc, esr.workPlace, ZSTD_BLOCKSIZE_ABSOLUTEMAX, src, srcSize);
@@ -810,7 +811,7 @@ static size_t ZDICT_analyzeEntropy(void*  dstBuffer, size_t maxDstSize,
     MEM_writeLE32(dstPtr+4, repStartValue[1]);
     MEM_writeLE32(dstPtr+8, repStartValue[2]);
 #endif
-    dstPtr += 12;
+    //dstPtr += 12;
     eSize += 12;
 
 _cleanup:
@@ -910,7 +911,7 @@ size_t ZDICT_trainFromBuffer_unsafe(
 
     /* create dictionary */
     {   U32 dictContentSize = ZDICT_dictSize(dictList);
-        if (dictContentSize < targetDictSize/2) {
+        if (dictContentSize < targetDictSize/3) {
             DISPLAYLEVEL(2, "!  warning : selected content significantly smaller than requested (%u < %u) \n", dictContentSize, (U32)maxDictSize);
             if (minRep > MINRATIO) {
                 DISPLAYLEVEL(2, "!  consider increasing selectivity to produce larger dictionary (-s%u) \n", selectivity+1);
@@ -920,12 +921,12 @@ size_t ZDICT_trainFromBuffer_unsafe(
                 DISPLAYLEVEL(2, "!  consider increasing the number of samples (total size : %u MB)\n", (U32)(samplesBuffSize>>20));
         }
 
-        if ((dictContentSize > targetDictSize*2) && (nbSamples > 2*MINRATIO) && (selectivity>1)) {
+        if ((dictContentSize > targetDictSize*3) && (nbSamples > 2*MINRATIO) && (selectivity>1)) {
             U32 proposedSelectivity = selectivity-1;
             while ((nbSamples >> proposedSelectivity) <= MINRATIO) { proposedSelectivity--; }
             DISPLAYLEVEL(2, "!  note : calculated dictionary significantly larger than requested (%u > %u) \n", dictContentSize, (U32)maxDictSize);
-            DISPLAYLEVEL(2, "!  you may consider decreasing selectivity to produce denser dictionary (-s%u) \n", proposedSelectivity);
-            DISPLAYLEVEL(2, "!  but test its efficiency on samples \n");
+            DISPLAYLEVEL(2, "!  consider increasing dictionary size, or produce denser dictionary (-s%u) \n", proposedSelectivity);
+            DISPLAYLEVEL(2, "!  always test dictionary efficiency on samples \n");
         }
 
         /* limit dictionary size */

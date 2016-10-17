@@ -8,13 +8,6 @@
  */
 
 
-/*
-  Note : this is a user program, not part of libzstd.
-  The license of libzstd is BSD.
-  The license of this command line program is GPLv2.
-*/
-
-
 /*-************************************
 *  Tuning parameters
 **************************************/
@@ -23,7 +16,7 @@
 #endif
 
 #ifndef ZSTDCLI_CLEVEL_MAX
-#  define ZSTDCLI_CLEVEL_MAX 19
+#  define ZSTDCLI_CLEVEL_MAX 19   /* when not using --ultra */
 #endif
 
 
@@ -51,13 +44,11 @@
 #if defined(MSDOS) || defined(OS2) || defined(WIN32) || defined(_WIN32) || defined(__CYGWIN__)
 #  include <io.h>       /* _isatty */
 #  define IS_CONSOLE(stdStream) _isatty(_fileno(stdStream))
+#elif defined(_POSIX_C_SOURCE) || defined(_XOPEN_SOURCE) || defined(_POSIX_SOURCE) || (defined(__APPLE__) && defined(__MACH__))  /* https://sourceforge.net/p/predef/wiki/OperatingSystems/ */
+#  include <unistd.h>   /* isatty */
+#  define IS_CONSOLE(stdStream) isatty(fileno(stdStream))
 #else
-#  if defined(_POSIX_C_SOURCE) || defined(_XOPEN_SOURCE) || defined(_POSIX_SOURCE) || (defined(__APPLE__) && defined(__MACH__))  /* https://sourceforge.net/p/predef/wiki/OperatingSystems/ */
-#    include <unistd.h>   /* isatty */
-#    define IS_CONSOLE(stdStream) isatty(fileno(stdStream))
-#  else
-#    define IS_CONSOLE(stdStream) 0
-#  endif
+#  define IS_CONSOLE(stdStream) 0
 #endif
 
 
@@ -144,6 +135,8 @@ static int usage_advanced(const char* programName)
     DISPLAY( "--test  : test compressed file integrity \n");
     DISPLAY( "--[no-]sparse : sparse mode (default:enabled on file, disabled on stdout)\n");
 #endif
+    DISPLAY( " -M#    : Set a memory usage limit for decompression \n");
+    DISPLAY( "--      : All arguments after \"--\" are treated as files \n");
 #ifndef ZSTD_NODICT
     DISPLAY( "\n");
     DISPLAY( "Dictionary builder :\n");
@@ -180,21 +173,34 @@ static void waitEnter(void)
 }
 
 /*! readU32FromChar() :
-    @return : unsigned integer value reach from input in `char` format
+    @return : unsigned integer value read from input in `char` format
+    allows and interprets K, KB, KiB, M, MB and MiB suffix.
     Will also modify `*stringPtr`, advancing it to position where it stopped reading.
-    Note : this function can overflow if digit string > MAX_UINT */
+    Note : function result can overflow if digit string > MAX_UINT */
 static unsigned readU32FromChar(const char** stringPtr)
 {
     unsigned result = 0;
     while ((**stringPtr >='0') && (**stringPtr <='9'))
         result *= 10, result += **stringPtr - '0', (*stringPtr)++ ;
+    if (toupper(**stringPtr)=='K') result <<= 10, (*stringPtr)++ ;
+    else if (toupper(**stringPtr)=='M') result <<= 20, (*stringPtr)++ ;
+    if (toupper(**stringPtr)=='i') (*stringPtr)++;
+    if (toupper(**stringPtr)=='B') (*stringPtr)++;
+    return result;
+}
+
+static unsigned longCommandWArg(const char** stringPtr, const char* longCommand)
+{
+    size_t const comSize = strlen(longCommand);
+    unsigned const result = !strncmp(*stringPtr, longCommand, comSize);
+    if (result) *stringPtr += comSize;
     return result;
 }
 
 
 #define CLEAN_RETURN(i) { operationResult = (i); goto _end; }
 
-int main(int argCount, char** argv)
+int main(int argCount, const char* argv[])
 {
     int argNb,
         bench=0,
@@ -209,22 +215,23 @@ int main(int argCount, char** argv)
         nextArgumentIsMaxDict=0,
         nextArgumentIsDictID=0,
         nextArgumentIsFile=0,
-        ultra=0;
+        ultra=0,
+        lastCommand = 0;
     int cLevel = ZSTDCLI_CLEVEL_DEFAULT;
     int cLevelLast = 1;
     unsigned recursive = 0;
+    unsigned memLimit = 0;
     const char** filenameTable = (const char**)malloc(argCount * sizeof(const char*));   /* argCount >= 1 */
     unsigned filenameIdx = 0;
     const char* programName = argv[0];
     const char* outFileName = NULL;
     const char* dictFileName = NULL;
-    char* dynNameSpace = NULL;
     unsigned maxDictSize = g_defaultMaxDictSize;
     unsigned dictID = 0;
     int dictCLevel = g_defaultDictCLevel;
     unsigned dictSelect = g_defaultSelectivityLevel;
 #ifdef UTIL_HAS_CREATEFILELIST
-    const char** fileNamesTable = NULL;
+    const char** extendedFileList = NULL;
     char* fileNamesBuf = NULL;
     unsigned fileNamesNb;
 #endif
@@ -232,7 +239,8 @@ int main(int argCount, char** argv)
     /* init */
     (void)recursive; (void)cLevelLast;    /* not used when ZSTD_NOBENCH set */
     (void)dictCLevel; (void)dictSelect; (void)dictID;  /* not used when ZSTD_NODICT set */
-    (void)decode; (void)cLevel; /* not used when ZSTD_NOCOMPRESS set */
+    (void)decode; (void)cLevel; (void)testmode; /* not used when ZSTD_NOCOMPRESS set */
+    (void)ultra; (void)memLimit;   /* not used when ZSTD_NODECOMPRESS set */
     if (filenameTable==NULL) { DISPLAY("zstd: %s \n", strerror(errno)); exit(1); }
     filenameTable[0] = stdinmark;
     displayOut = stderr;
@@ -247,22 +255,22 @@ int main(int argCount, char** argv)
     if (!strcmp(programName, ZSTD_CAT)) { decode=1; forceStdout=1; displayLevel=1; outFileName=stdoutmark; }
 
     /* command switches */
-    for(argNb=1; argNb<argCount; argNb++) {
+    for (argNb=1; argNb<argCount; argNb++) {
         const char* argument = argv[argNb];
         if(!argument) continue;   /* Protection if argument empty */
 
         if (nextArgumentIsFile==0) {
 
             /* long commands (--long-word) */
-            if (!strcmp(argument, "--")) { nextArgumentIsFile=1; continue; }
+            if (!strcmp(argument, "--")) { nextArgumentIsFile=1; continue; }   /* only file names allowed from now on */
             if (!strcmp(argument, "--decompress")) { decode=1; continue; }
-            if (!strcmp(argument, "--force")) {  FIO_overwriteMode(); continue; }
+            if (!strcmp(argument, "--force")) { FIO_overwriteMode(); continue; }
             if (!strcmp(argument, "--version")) { displayOut=stdout; DISPLAY(WELCOME_MESSAGE); CLEAN_RETURN(0); }
             if (!strcmp(argument, "--help")) { displayOut=stdout; CLEAN_RETURN(usage_advanced(programName)); }
             if (!strcmp(argument, "--verbose")) { displayLevel++; continue; }
             if (!strcmp(argument, "--quiet")) { displayLevel--; continue; }
             if (!strcmp(argument, "--stdout")) { forceStdout=1; outFileName=stdoutmark; displayLevel-=(displayLevel==2); continue; }
-            if (!strcmp(argument, "--ultra")) { ultra=1; FIO_setMaxWLog(0); continue; }
+            if (!strcmp(argument, "--ultra")) { ultra=1; continue; }
             if (!strcmp(argument, "--check")) { FIO_setChecksumFlag(2); continue; }
             if (!strcmp(argument, "--no-check")) { FIO_setChecksumFlag(0); continue; }
             if (!strcmp(argument, "--no-dictID")) { FIO_setDictIDFlag(0); continue; }
@@ -270,10 +278,15 @@ int main(int argCount, char** argv)
             if (!strcmp(argument, "--no-sparse")) { FIO_setSparseWrite(0); continue; }
             if (!strcmp(argument, "--test")) { testmode=1; decode=1; continue; }
             if (!strcmp(argument, "--train")) { dictBuild=1; outFileName=g_defaultDictName; continue; }
-            if (!strcmp(argument, "--maxdict")) { nextArgumentIsMaxDict=1; continue; }
-            if (!strcmp(argument, "--dictID")) { nextArgumentIsDictID=1; continue; }
+            if (!strcmp(argument, "--maxdict")) { nextArgumentIsMaxDict=1; lastCommand=1; continue; }
+            if (!strcmp(argument, "--dictID")) { nextArgumentIsDictID=1; lastCommand=1; continue; }
             if (!strcmp(argument, "--keep")) { FIO_setRemoveSrcFile(0); continue; }
             if (!strcmp(argument, "--rm")) { FIO_setRemoveSrcFile(1); continue; }
+
+            /* long commands with arguments */
+            if (longCommandWArg(&argument, "--memlimit=")) { memLimit = readU32FromChar(&argument); continue; }
+            if (longCommandWArg(&argument, "--memory=")) { memLimit = readU32FromChar(&argument); continue; }
+            if (longCommandWArg(&argument, "--memlimit-decompress=")) { memLimit = readU32FromChar(&argument); continue; }
 
             /* '-' means stdin/stdout */
             if (!strcmp(argument, "-")){
@@ -289,6 +302,10 @@ int main(int argCount, char** argv)
                 argument++;
 
                 while (argument[0]!=0) {
+                    if (lastCommand) {
+                        DISPLAY("error : command must be followed by argument \n");
+                        return 1;
+                    }
 #ifndef ZSTD_NOCOMPRESS
                     /* compression Level */
                     if ((*argument>='0') && (*argument<='9')) {
@@ -311,7 +328,7 @@ int main(int argCount, char** argv)
                     case 'c': forceStdout=1; outFileName=stdoutmark; argument++; break;
 
                         /* Use file content as dictionary */
-                    case 'D': nextEntryIsDictionary = 1; argument++; break;
+                    case 'D': nextEntryIsDictionary = 1; lastCommand = 1; argument++; break;
 
                         /* Overwrite */
                     case 'f': FIO_overwriteMode(); forceStdout=1; argument++; break;
@@ -332,10 +349,18 @@ int main(int argCount, char** argv)
                     case 't': testmode=1; decode=1; argument++; break;
 
                         /* destination file name */
-                    case 'o': nextArgumentIsOutFileName=1; argument++; break;
+                    case 'o': nextArgumentIsOutFileName=1; lastCommand=1; argument++; break;
 
+                        /* limit decompression memory */
+                    case 'M':
+                        argument++;
+                        memLimit = readU32FromChar(&argument);
+                        break;
+
+#ifdef UTIL_HAS_CREATEFILELIST
                         /* recursive */
                     case 'r': recursive=1; argument++; break;
+#endif
 
 #ifndef ZSTD_NOBENCH
                         /* Benchmark */
@@ -360,10 +385,7 @@ int main(int argCount, char** argv)
                         /* cut input into blocks (benchmark only) */
                     case 'B':
                         argument++;
-                        {   size_t bSize = readU32FromChar(&argument);
-                            if (toupper(*argument)=='K') bSize<<=10, argument++;  /* allows using KB notation */
-                            if (toupper(*argument)=='M') bSize<<=20, argument++;
-                            if (toupper(*argument)=='B') argument++;
+                        {   size_t const bSize = readU32FromChar(&argument);
                             BMK_setNotificationLevel(displayLevel);
                             BMK_SetBlockSize(bSize);
                         }
@@ -394,14 +416,14 @@ int main(int argCount, char** argv)
 
             if (nextArgumentIsMaxDict) {
                 nextArgumentIsMaxDict = 0;
+                lastCommand = 0;
                 maxDictSize = readU32FromChar(&argument);
-                if (toupper(*argument)=='K') maxDictSize <<= 10;
-                if (toupper(*argument)=='M') maxDictSize <<= 20;
                 continue;
             }
 
             if (nextArgumentIsDictID) {
                 nextArgumentIsDictID = 0;
+                lastCommand = 0;
                 dictID = readU32FromChar(&argument);
                 continue;
             }
@@ -410,12 +432,14 @@ int main(int argCount, char** argv)
 
         if (nextEntryIsDictionary) {
             nextEntryIsDictionary = 0;
+            lastCommand = 0;
             dictFileName = argument;
             continue;
         }
 
         if (nextArgumentIsOutFileName) {
             nextArgumentIsOutFileName = 0;
+            lastCommand = 0;
             outFileName = argument;
             if (!strcmp(outFileName, "-")) outFileName = stdoutmark;
             continue;
@@ -425,17 +449,19 @@ int main(int argCount, char** argv)
         filenameTable[filenameIdx++] = argument;
     }
 
+    if (lastCommand) { DISPLAY("error : command must be followed by argument \n"); return 1; }  /* forgotten argument */
+
     /* Welcome message (if verbose) */
     DISPLAYLEVEL(3, WELCOME_MESSAGE);
 
 #ifdef UTIL_HAS_CREATEFILELIST
-    if (recursive) {
-        fileNamesTable = UTIL_createFileList(filenameTable, filenameIdx, &fileNamesBuf, &fileNamesNb);
-        if (fileNamesTable) {
+    if (recursive) {  /* at this stage, filenameTable is a list of paths, which can contain both files and directories */
+        extendedFileList = UTIL_createFileList(filenameTable, filenameIdx, &fileNamesBuf, &fileNamesNb);
+        if (extendedFileList) {
             unsigned u;
-            for (u=0; u<fileNamesNb; u++) DISPLAYLEVEL(4, "%u %s\n", u, fileNamesTable[u]);
+            for (u=0; u<fileNamesNb; u++) DISPLAYLEVEL(4, "%u %s\n", u, extendedFileList[u]);
             free((void*)filenameTable);
-            filenameTable = fileNamesTable;
+            filenameTable = extendedFileList;
             filenameIdx = fileNamesNb;
         }
     }
@@ -479,12 +505,14 @@ int main(int argCount, char** argv)
         CLEAN_RETURN(filenameIdx);
     }
 
+#ifndef ZSTD_NOCOMPRESS
     /* check compression level limits */
     {   int const maxCLevel = ultra ? ZSTD_maxCLevel() : ZSTDCLI_CLEVEL_MAX;
         if (cLevel > maxCLevel) {
             DISPLAYLEVEL(2, "Warning : compression level higher than max, reduced to %i \n", maxCLevel);
             cLevel = maxCLevel;
     }   }
+#endif
 
     /* No warning message in pipe mode (stdin + stdout) or multi-files mode */
     if (!strcmp(filenameTable[0], stdinmark) && outFileName && !strcmp(outFileName,stdoutmark) && (displayLevel==2)) displayLevel=1;
@@ -492,17 +520,19 @@ int main(int argCount, char** argv)
 
     /* IO Stream/File */
     FIO_setNotificationLevel(displayLevel);
-#ifndef ZSTD_NOCOMPRESS
     if (!decode) {
-        if (filenameIdx==1 && outFileName)
+#ifndef ZSTD_NOCOMPRESS
+        if ((filenameIdx==1) && outFileName)
           operationResult = FIO_compressFilename(outFileName, filenameTable[0], dictFileName, cLevel);
         else
           operationResult = FIO_compressMultipleFilenames(filenameTable, filenameIdx, outFileName ? outFileName : ZSTD_EXTENSION, dictFileName, cLevel);
-    } else
+#else
+        DISPLAY("Compression not supported\n");
 #endif
-    {  /* decompression */
+    } else {  /* decompression */
 #ifndef ZSTD_NODECOMPRESS
         if (testmode) { outFileName=nulmark; FIO_setRemoveSrcFile(0); } /* test mode */
+        FIO_setMemLimit(memLimit);
         if (filenameIdx==1 && outFileName)
             operationResult = FIO_decompressFilename(outFileName, filenameTable[0], dictFileName);
         else
@@ -514,10 +544,9 @@ int main(int argCount, char** argv)
 
 _end:
     if (main_pause) waitEnter();
-    free(dynNameSpace);
 #ifdef UTIL_HAS_CREATEFILELIST
-    if (fileNamesTable)
-        UTIL_freeFileList(fileNamesTable, fileNamesBuf);
+    if (extendedFileList)
+        UTIL_freeFileList(extendedFileList, fileNamesBuf);
     else
 #endif
         free((void*)filenameTable);
